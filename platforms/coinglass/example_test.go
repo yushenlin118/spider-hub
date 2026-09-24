@@ -2,6 +2,8 @@ package coinglass
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -143,6 +145,136 @@ func TestSpotSupportCoin(t *testing.T) {
 
 	preview := getDataPreview(result, 100)
 	t.Logf("✅ 现货支持币种获取成功，数据长度: %d, 数据预览: %s", len(result), preview)
+}
+
+// 🏦 TestETFFlow 测试比特币现货ETF净流入流出接口
+// 📊 对应前台图表「比特币现货ETF净流入流出 (BTC)」
+func TestETFFlow(t *testing.T) {
+	// 🚀 获取全量历史数据
+	days, err := spider.GetETFFlow()
+	if err != nil {
+		t.Fatalf("❌ 获取ETF净流入流出数据失败: %v", err)
+	}
+
+	if len(days) == 0 {
+		t.Fatal("❌ 返回的ETF数据为空")
+	}
+
+	t.Logf("✅ ETF净流入流出数据获取成功，共 %d 天，区间 %s ~ %s",
+		len(days),
+		days[0].Time().Format("2006-01-02"),
+		days[len(days)-1].Time().Format("2006-01-02"))
+
+	// 📅 打印最近5天的总量
+	fmt.Println("\n📅 最近5天比特币现货ETF净流入流出:")
+	for _, d := range days[len(days)-5:] {
+		fmt.Printf("  %s  %+12.2f BTC  (%+9.1f 百万美元)\n",
+			d.Time().Format("2006-01-02"), d.Change, d.ChangeUsd/1e6)
+	}
+
+	// 🏢 打印最新一日的发行商明细
+	latest := days[len(days)-1]
+	fmt.Printf("\n🏢 %s 各发行商明细:\n", latest.Time().Format("2006-01-02"))
+	for _, issuer := range latest.List {
+		fmt.Printf("  %-6s %-16s %+12.2f BTC  %+9.1f 百万美元\n",
+			issuer.Ticker, issuer.Name, issuer.Change, issuer.ChangeUsd/1e6)
+	}
+}
+
+// 📉 TestETFSpotInFlow 测试比特币现货ETF净流入及资产快照接口
+// 💡 精简版数据，无发行商拆分，但含ETF总净资产和BTC价格
+func TestETFSpotInFlow(t *testing.T) {
+	days, err := spider.GetETFSpotInFlow()
+	if err != nil {
+		t.Fatalf("❌ 获取ETF净流入数据失败: %v", err)
+	}
+
+	if len(days) == 0 {
+		t.Fatal("❌ 返回的ETF数据为空")
+	}
+
+	latest := days[len(days)-1]
+	t.Logf("✅ ETF净流入数据获取成功，共 %d 天", len(days))
+	fmt.Printf("\n📊 %s 快照: 净流入 %+.1f 百万美元, 总净资产 %.1f 亿美元, BTC价格 $%.1f\n",
+		latest.Time().Format("2006-01-02"),
+		latest.Change/1e6, latest.NetAssets/1e8, latest.BtcPrice)
+}
+
+// 📋 TestETFList 测试比特币现货ETF清单接口
+// 🏦 获取各ETF的发行商、托管方、AUM、管理费率等基本信息
+func TestETFList(t *testing.T) {
+	list, err := spider.GetETFList()
+	if err != nil {
+		t.Fatalf("❌ 获取ETF清单失败: %v", err)
+	}
+
+	if len(list) == 0 {
+		t.Fatal("❌ 返回的ETF清单为空")
+	}
+
+	t.Logf("✅ ETF清单获取成功，共 %d 只", len(list))
+
+	fmt.Println("\n🏦 比特币现货ETF清单（前5只）:")
+	for i, etf := range list {
+		if i >= 5 {
+			break
+		}
+		fmt.Printf("  %-6s %-30s 发行商: %-12s AUM: %.1f 亿美元  费率: %.2f%%\n",
+			etf.Ticker, strings.TrimSpace(etf.ETFName), etf.Issuer,
+			etf.Aum/1e8, etf.Fee*100)
+	}
+}
+
+// 🔥 TestCoinsHeatmap 测试币种热力图接口
+// 📊 对应首页「热力图(24小时)」，验证三种指标类型
+func TestCoinsHeatmap(t *testing.T) {
+	types := []struct {
+		key  string
+		desc string
+		unit string
+	}{
+		{HeatmapTypeVol, "24小时成交额", "亿美元"},
+		{HeatmapTypeOI, "持仓量", "亿美元"},
+		{HeatmapTypePrice, "24小时涨跌幅", "%"},
+	}
+
+	for _, ty := range types {
+		coins, err := spider.GetCoinsHeatmap(ty.key)
+		if err != nil {
+			t.Fatalf("❌ 获取热力图失败 (type=%s): %v", ty.key, err)
+		}
+
+		if len(coins) == 0 {
+			t.Fatalf("❌ 热力图数据为空 (type=%s)", ty.key)
+		}
+
+		t.Logf("✅ 热力图获取成功 (type=%s, %s)，共 %d 个币种", ty.key, ty.desc, len(coins))
+
+		// 📊 按指标值降序，取前5名
+		sorted := make([]HeatmapCoin, len(coins))
+		copy(sorted, coins)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].Value > sorted[j].Value })
+
+		fmt.Printf("\n🔥 %s 排行（前5）:\n", ty.desc)
+		for _, c := range sorted[:5] {
+			value := c.Value
+			if ty.unit == "亿美元" {
+				value /= 1e8
+			}
+			fmt.Printf("  %-8s %12.2f %-8s 24h涨跌 %+7.2f%%\n",
+				c.Symbol, value, ty.unit, c.PriceChangePercent)
+		}
+	}
+}
+
+// 🚫 TestCoinsHeatmapInvalidType 测试热力图非法类型参数
+// ⚠️ 服务端对非法type返回Server Error，客户端应提前拦截
+func TestCoinsHeatmapInvalidType(t *testing.T) {
+	if _, err := spider.GetCoinsHeatmap("marketCap"); err == nil {
+		t.Fatal("❌ 非法类型应返回错误，但没有")
+	} else {
+		t.Logf("✅ 非法类型已被正确拦截: %v", err)
+	}
 }
 
 // 🔧 buildURLWithParams 构建带参数的URL
