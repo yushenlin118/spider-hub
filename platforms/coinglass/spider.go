@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -41,7 +42,7 @@ type Spider struct {
 //	data, err := spider.GetData("https://capi.coinglass.com/api/...")
 func NewSpider() *Spider {
 	client := resty.New()
-	client.SetTimeout(30 * time.Second) // ⏱️ 设置30秒超时
+	client.SetTimeout(RequestTimeoutSeconds * time.Second) // ⏱️ 设置请求超时
 
 	return &Spider{
 		client: client,
@@ -74,14 +75,20 @@ func (s *Spider) GetData(apiURL string) (string, error) {
 	// ⏰ 生成时间戳作为加密密钥的一部分
 	cacheTsV2 := fmt.Sprintf("%d", time.Now().UnixMilli())
 
-	// 🔐 第一步：获取加密的响应数据和动态密钥
-	response, userHeader, err := s.getEncryptedData(apiURL, cacheTsV2)
+	// 🔐 第一步：获取加密的响应数据、动态密钥和加密版本标识
+	response, meta, err := s.getEncryptedData(apiURL, cacheTsV2)
 	if err != nil {
 		return "", fmt.Errorf("获取加密数据失败: %v", err)
 	}
 
-	// 🔓 第二步：解密数据并解压gzip
-	decryptedData, err := s.decryptData(response, cacheTsV2, userHeader)
+	// 🔑 第二步：根据响应头 v 决定密钥来源
+	keySource, err := s.deriveKeySource(meta, apiURL, cacheTsV2)
+	if err != nil {
+		return "", err
+	}
+
+	// 🔓 第三步：解密数据并解压gzip
+	decryptedData, err := s.decryptData(response, keySource, meta.User)
 	if err != nil {
 		return "", fmt.Errorf("解密数据失败: %v", err)
 	}
@@ -104,50 +111,42 @@ func (s *Spider) GetData(apiURL string) (string, error) {
 //	*CoinglassResponse - 📦 加密的API响应结构
 //	string            - 🔑 用户动态密钥（从response header获取）
 //	error             - ❌ 请求错误信息
-func (s *Spider) getEncryptedData(apiURL, cacheTsV2 string) (*CoinglassResponse, string, error) {
-	// 🎭 设置完整的浏览器请求头，模拟真实用户访问
-	headers := map[string]string{
-		"accept":             "application/json",                                                                                                // 📋 接受JSON响应
-		"accept-language":    "zh-CN,zh;q=0.9",                                                                                                  // 🌏 语言偏好
-		"cache-ts-v2":        cacheTsV2,                                                                                                         // ⏰ 时间戳密钥
-		"encryption":         "true",                                                                                                            // 🔐 启用加密
-		"language":           "zh",                                                                                                              // 🈳 界面语言
-		"origin":             "https://www.coinglass.com",                                                                                       // 🏠 请求来源
-		"priority":           "u=1, i",                                                                                                          // 🚦 请求优先级
-		"referer":            "https://www.coinglass.com/",                                                                                      // 🔗 引用页面
-		"sec-ch-ua":          `"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"`,                                                // 🌐 浏览器标识
-		"sec-ch-ua-mobile":   "?0",                                                                                                              // 📱 非移动设备
-		"sec-ch-ua-platform": `"Windows"`,                                                                                                       // 💻 操作系统
-		"sec-fetch-dest":     "empty",                                                                                                           // 🎯 请求目标
-		"sec-fetch-mode":     "cors",                                                                                                            // 🔄 CORS模式
-		"sec-fetch-site":     "same-site",                                                                                                       // 🏠 同站请求
-		"user-agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36", // 🕷️ 用户代理
+func (s *Spider) getEncryptedData(apiURL, cacheTsV2 string) (*CoinglassResponse, *ResponseMeta, error) {
+	// 🎭 复用constants.go中定义的浏览器请求头，模拟真实用户访问
+	headers := make(map[string]string, len(RequestHeaders)+1)
+	for k, v := range RequestHeaders {
+		headers[k] = v
 	}
+	headers["cache-ts-v2"] = cacheTsV2 // ⏰ 时间戳密钥，每次请求动态生成
 
 	// 🚀 发送HTTP GET请求
 	resp, err := s.client.R().SetHeaders(headers).Get(apiURL)
 	if err != nil {
-		return nil, "", fmt.Errorf("请求失败: %v", err)
+		return nil, nil, fmt.Errorf("请求失败: %v", err)
 	}
 
 	// 🔍 检查HTTP状态码
 	if resp.StatusCode() != 200 {
-		return nil, "", fmt.Errorf("HTTP状态码错误: %d", resp.StatusCode())
+		return nil, nil, fmt.Errorf("HTTP状态码错误: %d", resp.StatusCode())
 	}
 
-	// 🔑 从响应头获取动态解密密钥
-	userHeader := resp.Header().Get("user")
-	if userHeader == "" {
-		return nil, "", fmt.Errorf("未找到user header")
+	// 🔑 从响应头获取动态解密密钥与加密版本标识
+	meta := &ResponseMeta{
+		User: resp.Header().Get("user"),
+		V:    resp.Header().Get("v"),
+		Time: resp.Header().Get("time"),
+	}
+	if meta.User == "" {
+		return nil, nil, fmt.Errorf("未找到user header")
 	}
 
 	// 📦 解析JSON响应体
 	var response CoinglassResponse
 	if err := json.Unmarshal(resp.Body(), &response); err != nil {
-		return nil, "", fmt.Errorf("解析响应失败: %v", err)
+		return nil, nil, fmt.Errorf("解析响应失败: %v", err)
 	}
 
-	return &response, userHeader, nil
+	return &response, meta, nil
 }
 
 // decryptData 解密数据
@@ -171,10 +170,13 @@ func (s *Spider) getEncryptedData(apiURL, cacheTsV2 string) (*CoinglassResponse,
 //
 //	string - 📄 解密后的JSON字符串
 //	error  - ❌ 解密过程中的错误
-func (s *Spider) decryptData(response *CoinglassResponse, cacheTsV2, userHeader string) (string, error) {
-	// 🔑 第一步：生成时间戳密钥（Base64编码后取前16位）
-	timestampEncoded := base64.StdEncoding.EncodeToString([]byte(cacheTsV2))
-	timestampKey := []byte(timestampEncoded[:16])
+func (s *Spider) decryptData(response *CoinglassResponse, keySource, userHeader string) (string, error) {
+	// 🔑 第一步：密钥来源Base64编码后取前16位（对应前端 btoa(a).substring(0,16)）
+	encoded := base64.StdEncoding.EncodeToString([]byte(keySource))
+	if len(encoded) < 16 {
+		return "", fmt.Errorf("密钥来源过短: %q", keySource)
+	}
+	timestampKey := []byte(encoded[:16])
 
 	// 🔓 第二步：解密user header获取动态密钥
 	userCiphertext, err := base64.StdEncoding.DecodeString(userHeader)
@@ -352,4 +354,180 @@ func (s *Spider) parseDecryptedHex(hexString string) (string, error) {
 
 	// 📊 返回解压后的JSON字符串
 	return decompressed.String(), nil
+}
+
+// GetETFFlow 获取比特币现货ETF每日净流入流出
+// 🏦 这是前台图表「比特币现货ETF净流入流出 (BTC)」的数据源
+// 📊 返回自ETF上市首日至今的完整历史，按日期升序排列
+// 💡 Change 字段单位为BTC，ChangeUsd 为美元；每日附带各发行商明细
+//
+// ⚠️ 该接口不支持分页，单次返回全量数据（约600KB）
+//
+// 返回:
+//
+//	[]ETFFlowDay - 📅 按日期升序的每日流入流出数据
+//	error        - ❌ 请求或解析失败
+//
+// 使用示例:
+//
+//	days, err := spider.GetETFFlow()
+//	latest := days[len(days)-1]  // 最新一日
+func (s *Spider) GetETFFlow() ([]ETFFlowDay, error) {
+	data, err := s.GetData(BaseURL + ETFFlowEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("❌ 获取ETF流入流出数据失败: %w", err)
+	}
+
+	var days []ETFFlowDay
+	if err := json.Unmarshal([]byte(data), &days); err != nil {
+		return nil, fmt.Errorf("❌ 解析ETF流入流出数据失败: %w", err)
+	}
+
+	return days, nil
+}
+
+// GetETFSpotInFlow 获取比特币现货ETF每日净流入及资产快照
+// 📉 精简版数据，含当日净流入（美元）、ETF总净资产、BTC价格，但无发行商拆分
+// 📊 适合只关心总量趋势的场景
+//
+// 返回:
+//
+//	[]ETFSpotInFlowDay - 📅 按日期升序的每日数据
+//	error              - ❌ 请求或解析失败
+func (s *Spider) GetETFSpotInFlow() ([]ETFSpotInFlowDay, error) {
+	data, err := s.GetData(BaseURL + ETFSpotInFlowEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("❌ 获取ETF净流入数据失败: %w", err)
+	}
+
+	var days []ETFSpotInFlowDay
+	if err := json.Unmarshal([]byte(data), &days); err != nil {
+		return nil, fmt.Errorf("❌ 解析ETF净流入数据失败: %w", err)
+	}
+
+	return days, nil
+}
+
+// GetETFList 获取比特币现货ETF清单
+// 📋 返回各ETF的基本信息: 代码、发行商、托管方、AUM、管理费率等
+//
+// 返回:
+//
+//	[]ETFInfo - 🏦 ETF信息列表
+//	error     - ❌ 请求或解析失败
+func (s *Spider) GetETFList() ([]ETFInfo, error) {
+	data, err := s.GetData(BaseURL + ETFListEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("❌ 获取ETF清单失败: %w", err)
+	}
+
+	var list []ETFInfo
+	if err := json.Unmarshal([]byte(data), &list); err != nil {
+		return nil, fmt.Errorf("❌ 解析ETF清单失败: %w", err)
+	}
+
+	return list, nil
+}
+
+// GetCoinsHeatmap 获取币种热力图数据
+// 🔥 这是首页「热力图(24小时)」的数据源，返回全部币种（实测1612个）
+// 📊 PriceChangePercent 恒为24小时涨跌幅（决定方块颜色）
+// 📐 Value 的含义由 heatmapType 决定（决定方块大小）
+//
+// 参数:
+//
+//	heatmapType - 🎨 指标类型，须为 HeatmapTypePrice / HeatmapTypeVol / HeatmapTypeOI 之一
+//
+// 返回:
+//
+//	[]HeatmapCoin - 🪙 币种热力图数据
+//	error         - ❌ 请求或解析失败
+//
+// ⚠️ 传入其他值（含数字）服务端会返回 Server Error
+//
+// 使用示例:
+//
+//	coins, err := spider.GetCoinsHeatmap(coinglass.HeatmapTypeVol)
+//	// coins[i].Value 为该币种24小时成交额（美元）
+func (s *Spider) GetCoinsHeatmap(heatmapType string) ([]HeatmapCoin, error) {
+	switch heatmapType {
+	case HeatmapTypePrice, HeatmapTypeVol, HeatmapTypeOI:
+	default:
+		return nil, fmt.Errorf("❌ 无效的热力图类型: %q（可选值: %s / %s / %s）",
+			heatmapType, HeatmapTypePrice, HeatmapTypeVol, HeatmapTypeOI)
+	}
+
+	data, err := s.GetData(BaseURL + CoinsHeatmapEndpoint + "?type=" + heatmapType)
+	if err != nil {
+		return nil, fmt.Errorf("❌ 获取币种热力图失败: %w", err)
+	}
+
+	var coins []HeatmapCoin
+	if err := json.Unmarshal([]byte(data), &coins); err != nil {
+		return nil, fmt.Errorf("❌ 解析币种热力图失败: %w", err)
+	}
+
+	return coins, nil
+}
+
+// ResponseMeta 响应头中与解密相关的元数据
+// 🔑 服务端通过这些字段告知客户端该用哪种密钥推导方式
+type ResponseMeta struct {
+	User string // 🔐 加密的动态密钥
+	V    string // 🎛️ 密钥来源标识，决定 deriveKeySource 的分支
+	Time string // ⏰ 服务端时间戳（v=2 时作为密钥来源）
+}
+
+// deriveKeySource 根据响应头 v 决定AES密钥的来源字符串
+// 🎛️ 服务端会切换密钥推导方式，v 标识当前使用哪一种
+//
+// 对应前端 mn(response, urlPath) 的逻辑:
+//
+//	v=0  -> 请求时发送的 cache-ts-v2（毫秒时间戳）
+//	v=1  -> API路径（从 /api 起、不含查询字符串）
+//	v=2  -> 响应头 time
+//	v=55 -> 固定值 170b070da9654622
+//	v=66 -> 固定值 d6537d845a964081
+//	v=77 -> 固定值 863f08689c97435b
+//
+// ⚠️ 历史变更：2026-09-23 服务端由 v=0 切换为 v=1，
+// 若只实现 v=0 会解密失败并报「无效的PKCS7填充」
+func (s *Spider) deriveKeySource(meta *ResponseMeta, apiURL, cacheTsV2 string) (string, error) {
+	switch meta.V {
+	case "0":
+		return cacheTsV2, nil
+	case "1":
+		return extractAPIPath(apiURL), nil
+	case "2":
+		if meta.Time == "" {
+			return "", fmt.Errorf("v=2 但响应缺少 time header")
+		}
+		return meta.Time, nil
+	case "55":
+		return KeySourceV55, nil
+	case "66":
+		return KeySourceV66, nil
+	case "77":
+		return KeySourceV77, nil
+	default:
+		return "", fmt.Errorf("❌ 未知的加密版本 v=%q，服务端可能又更新了推导方式（见 README 的说明）", meta.V)
+	}
+}
+
+// extractAPIPath 从完整URL中截取用作密钥来源的路径片段
+// 📐 取 /api 开始到查询字符串之前的部分，如
+//
+//	https://capi.coinglass.com/api/etf/flow?x=1 -> /api/etf/flow
+//
+// 📝 找不到 /api 时返回原始URL（与前端行为一致）
+func extractAPIPath(rawURL string) string {
+	idx := strings.Index(rawURL, "/api")
+	if idx == -1 {
+		return rawURL
+	}
+	path := rawURL[idx:]
+	if q := strings.Index(path, "?"); q != -1 {
+		path = path[:q]
+	}
+	return path
 }
