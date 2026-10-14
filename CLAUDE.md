@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Spider-Hub 是一個**爬蟲逆向技術的範例集合**，不是一個可部署的服務。`cmd/spider-hub/main.go` 只印出說明文字，真正的程式碼都在 `platforms/` 底下，每個平台是一個獨立的 Go package，彼此不互相 import，也沒有共用的抽象層或介面。新增平台 = 新增一個資料夾，不需要修改任何既有檔案。
 
+**唯一例外是 `collectors/coinglass/`**：可部署的常駐程式，定期呼叫 `platforms/coinglass` 寫入 PostgreSQL。資料庫與 freqtrade 共用，**只能新增 `public.coinglass_*` 資料表，不可建立 schema／資料庫，也不可碰其他表**。`schema.sql` 啟動時自動執行（全用 `IF NOT EXISTS`，改欄位要自己寫遷移）；排程依 `coinglass_collector_run` 最近一筆紀錄判斷是否到期，所以重啟不會重抓。**資料表與欄位說明的唯一來源是 `schema.sql` 尾段的 `COMMENT ON`**（寫進資料庫，給其他 AI agent 讀），改表或改任務時更新它，再跑 `-migrate`（只套用 schema 與註解、不抓資料）。`DATA.md` 是通用使用指南（怎麼查註解、欄位與型態清單、新鮮度、歷史範圍、查詢範例），**只列欄位名稱與型態，不要把欄位說明寫回 DATA.md**。改表時要同步它的第 2 節欄位清單（從資料庫 `format_type()` 產生，別手打），新增資料表時再檢查範圍查詢要不要加一行。需要 `DATABASE_URL`，清算地圖另需 `COINGLASS_OBE`。`platforms/coinglass` 新增 typed 方法後，若要入庫，在 `jobs.go` 加一個 `Job`。
+
 ## 常用指令
 
 ```bash
@@ -17,6 +19,9 @@ cd platforms/coinglass && go test -v
 
 # 跑單一測試（測試會印大量 stdout，-v 是必要的）
 cd platforms/amazon && go test -run TestAmazonProductDetail -v
+
+# 收集器：所有任務跑一次（需要 DATABASE_URL）
+go run ./collectors/coinglass -once
 
 # 全專案格式化 / 檢查
 go fmt ./...
@@ -45,10 +50,14 @@ gofmt -l .
   - 易混淆：`/api/etf/flow` 是每日淨流入流出，`/api/etf/history/chart?type=2` 是持倉存量/AUM。
   - **金鑰來源由回應標頭 `v` 決定**（2026-09-23 伺服端從 `v=0` 切到 `v=1`，曾導致全平台解密失效）。還原自前端 `mn()`：`v=0` → 請求送出的 `cache-ts-v2`；`v=1` → **API 路徑**（從 `/api` 起、不含 query）；`v=2` → 回應標頭 `time`；`v=55/66/77` → 三個固定字串（見 `constants.go` 的 `KeySourceV*`）。取 `base64(來源)[:16]` 當 AES key，其餘流程不變。`deriveKeySource()` 已實作全部分支，遇到未知 `v` 會明確報錯而非回傳亂碼。
     - 注意 `ev` 標頭（目前為 2）**不是**切換旗標，是誤導 —— 它不在 `Access-Control-Expose-Headers` 名單裡，瀏覽器根本讀不到。認 `v`。
-    - **反混淆方法**（下次再改時直接重跑）：`app-*.js` 裡的 interceptor 用 javascript-obfuscator 的字串表混淆，解碼器 `Mn`（別名 `bn`）配字串陣列 `wn`，外加一個 checksum `191875` 的旋轉 IIFE。把這三塊原封不動抽進 node，就能把 `bn(341,"AQ3U")` 這類呼叫全部還原成字面量。金鑰推導在 `mn()`，AES 解密在 `xn()`。`gn`/`vn` 是另一組同構的解碼器。
+    - **反混淆方法**（下次再改時直接重跑）：`app-*.js` 裡的 interceptor 用 javascript-obfuscator 的字串表混淆，解碼器 `Mn`（別名 `bn`）配字串陣列 `wn`，外加一個 checksum `191875` 的旋轉 IIFE。把這三塊原封不動抽進 node，就能把 `bn(341,"AQ3U")` 這類呼叫全部還原成字面量。金鑰推導在 `mn()`，AES 解密在 `xn()`。`gn`/`vn` 是另一組同構的解碼器。**函式名每次部署都會換**（2026-10-05 版本已變成解碼器 `Sn`、字串陣列 `bn`、旋轉 checksum `859100`），不要照名字找，改用特徵定位：字串陣列是 `function XX(){var t=["`，旋轉 IIFE 是 `!function(t){for(var e=<解碼器>`…`}(<陣列>)`，請求 interceptor 在 `e.obe)&&(t.headers.obe` 附近。
     - 驗證訣竅：解對的話 `user` header 解密後是 gzip（magic `1f 8b`），解壓即得動態金鑰。用這個當 oracle 可離線掃金鑰，**不必反覆打線上 API**。
   - **熱力圖分四種，狀態不同**（皆 2026-09-23 實測）：首頁幣種熱力圖 `/api/futures/coins/heatmap?type=price|vol|oi` ✅ 可用（1612 幣，已包成 `GetCoinsHeatmap`，`type` 只吃這三個字串，傳數字會回 Server Error）；清算熱力圖 🔒 需登入；資金費率熱力圖 `/api/fundingRate/heatmap` 回 `null`；交易所熱力圖 `/api/derivative/exchange/heatmap` 的 `value` 恆為 0。後三者都是在解密正常時複測的真實回應。
-  - **清算熱力圖**端點是 `/api/index/v2/liqHeatMap`（不是 `/api/coin/liq/heatmap`），參數 `merge/symbol/interval/limit/data`：`symbol` 用 `Binance_BTCUSDT` 格式、`interval` 是 `h24` 不是 `24h`、`limit` 預設 288。`data` 是 TOTP 簽章（secret `I65VU7K5ZQL7WB4E`、step 30，拼成 `"<unixsec>,<6位碼>"` 後以 AES-256-ECB／key `1f68efd73f8d4921acc0dead41dd39bc` 加密再 base64）。簽章已驗證會被接受，但接口另外要求登入（回 `{"code":"40000"}`，即前端彈登入框的碼），故未實作。
+  - **清算熱力圖**端點是 `/api/index/v2/liqHeatMap`（不是 `/api/coin/liq/heatmap`），參數 `merge/symbol/interval/limit/data`：`symbol` 用 `Binance_BTCUSDT` 格式、`interval` 是 `h24` 不是 `24h`、`limit` 預設 288。`data` 是 TOTP 簽章（secret `I65VU7K5ZQL7WB4E`、step 30，拼成 `"<unixsec>,<6位碼>"` 後以 AES-256-ECB／key `1f68efd73f8d4921acc0dead41dd39bc` 加密再 base64）。簽章已驗證會被接受，但接口另外要求登入（回 `{"code":"40000"}`，即前端彈登入框的碼）。簽章已實作為 `generateLiqSign()`（`utils.go`）。
+  - **清算地圖**（`/pro/futures/LiquidationMap`）：`/api/index/5/liqMap`（交易對，需 `data` 簽章）與 `/api/index/2/exLiqMap`（幣種聚合，不需簽章），已包成 `GetLiquidationMap` / `GetExchangeLiquidationMap`。**需要登入**：前端 interceptor 讀 cookie `obe` 並放進同名請求標頭 `obe`，對應 `SetLoginToken()`。登入狀態下 `Spider` 會自動限速（`LoginMinRequestIntervalSeconds`），遇 40000 回 `ErrLoginRequired` 且不重試 —— 這是防止帳號被封的設計，不要拿掉。`interval` 對照見 `LiqMapRanges`（7 天是 `5` 不是 `7`）。回應的 `liqMapV2` 是「價格區間 → `[價格, 金額, 槓桿, h1|h2|h3]`」，解析在 `parseLiquidationMap()`（可餵存檔離線驗證）；`h1/h2/h3` 前端沒用到、意義未知，不要自己猜一個語意寫進去。`exLiqMap` 回應是 `data: [{instrument, liqMapV2}]` 每家交易所一筆（實測 Binance/OKX/Bybit），槓桿與標籤欄為 `null`，解析在 `parseExchangeLiquidationMap()`。
+  - **恐懼貪婪指數**（`/pro/i/FearGreedIndex`）：`/api/index/history?size=`（空字串＝全量，數字＝最近 N 筆），不需登入，已包成 `GetFearGreedIndex`。回應是陣列，前端只用 `data[0]`（`dates/values/prices` 三個等長陣列）；`data[1]`/`data[2]` 前端沒用到、意義未知，同樣不要自己猜。頁面 chunk 只有元件，資料函式在 `_app-*.js` 的 API 表裡（以 `url:"/api/..."` 定位）。
+  - **全球 M2**（`/pro/i/bitcoin-m2-supply-growth`）：接口在**另一個網域** `fapi.coinglass.com/api/index/globalM2SupplyGrowth`（`FapiBaseURL`），前端寫死完整 URL；加密協定與 capi 相同，`GetData` 直接可用，已包成 `GetGlobalM2SupplyGrowth`。`_app-*.js` 的 API 表裡還有一批 `https://fapi.coinglass.com/...` 開頭的宏觀指標（美國 M2、聯邦基金利率等），找不到 capi 路徑時記得也搜這個前綴。
+  - **現貨／合約流入流出**（`/spot-inflow-outflow` 頂部圖表）：其實是 `/api/v2/kline`，`symbol=ALL#<幣>#aggregated_spot_buy_sell_usd`（現貨）或 `aggregated_buy_sell_usd`（合約），回傳 `[秒級時間戳, 流入, 流出]`，已包成 `GetSpotFlow` / `GetFuturesFlow`。伺服端單次最多 4320 筆。可用 `endTime`（**秒**，毫秒會回空陣列）往回翻頁，但**伺服端只保留 h1/h4 約 180 天**，更早一律回空陣列（2026-10-08 實測，兩年前與 180 天外皆空）；h24 才有多年歷史。帶 `startTime` 會忽略 `limit` 直接回 4320 筆。別再試著回補更早的小時線。**`_app-*.js` 的 export 短名會跨模組重名**（這次 `uE` 依名字對照會誤指 `/api/largeTakerOrder`），要先找頁面 `r(<模組id>)` 引入的模組，在該模組範圍內解析 export。
 - **amazon** — 純 HTML 解析（goquery）+ 圖搜。圖搜流程是三步：先抓頁面裡的 `stylesnap` token → 下載圖片 → multipart 上傳搜尋；整串包在 `MaxRetries` 迴圈裡，任何一步失敗就整輪重來，因為 token 會失效。`extractor.go` 負責從 HTML 抽欄位，`utils.go` 負責價格／幣別／URL 驗證。
 - **foresightnews** — 回應的 `data` 欄位是 base64 + zlib。注意 `code != 0` 並非錯誤（該站 `code` 為 1 也是正常回應），程式碼裡刻意註解掉了 code 檢查，不要「修好」它。用標準 `net/http`，不是 resty。
 - **pexels** — 走 Next.js 的 `_next/data/<buildId>/...json` 端點，靠 `req` 的 `ImpersonateSafari()` 做 TLS/HTTP2 指紋偽裝過檢測。`NextDataBaseURL` 裡的 buildId 會隨對方部署變動，抓不到資料時先確認這個常數。目前 client 用 `req.DevMode()` 建立，會把完整請求／回應 dump 到 stdout。

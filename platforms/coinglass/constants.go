@@ -4,6 +4,10 @@ package coinglass
 // 📝 所有接口均挂载在该域名下，与前台站点 www.coinglass.com 分离
 const BaseURL = "https://capi.coinglass.com"
 
+// 🌐 FapiBaseURL 部分宏观指标接口所在的另一个域名
+// 📝 前端直接写死完整URL（如 M2 供应增长），加密协议与 BaseURL 完全相同，GetData 可直接请求
+const FapiBaseURL = "https://fapi.coinglass.com"
+
 // 📊 通用数据接口端点
 // 🔗 拼接方式: BaseURL + Endpoint + 查询参数
 const (
@@ -57,6 +61,62 @@ const (
 	ExchangeHeatmapEndpoint = "/api/derivative/exchange/heatmap"
 )
 
+// 😱 恐惧贪婪指数接口端点（前台 /pro/i/FearGreedIndex）
+const (
+	// FearGreedIndexEndpoint 恐惧贪婪指数历史
+	// 📝 参数 size：空字符串为全量（实测自 2018-02-01 起约每日一笔），数字为最近 N 笔
+	// 📦 返回数组，前端只用 data[0]（dates/values/prices 三个等长数组）
+	// ⚠️ data[1]、data[2] 是另外两条序列，前端未使用、含义未知，不要自行解读
+	// 🔓 不需要登录、不需要签名
+	FearGreedIndexEndpoint = "/api/index/history"
+)
+
+// 💵 宏观指标接口端点（挂在 FapiBaseURL 下）
+const (
+	// GlobalM2SupplyGrowthEndpoint 比特币 vs 全球M2货币供应增长（前台 /pro/i/bitcoin-m2-supply-growth）
+	// 📝 不带参数，单次返回全量；每周一笔，实测自 2013-05-20 起
+	// ⚠️ M2 为宏观数据，最新一笔通常落后当前日期约一个月
+	// 🔓 不需要登录
+	GlobalM2SupplyGrowthEndpoint = "/api/index/globalM2SupplyGrowth"
+)
+
+// 💸 资金流入流出接口端点（前台 /spot-inflow-outflow 顶部图表）
+const (
+	// FlowKlineEndpoint 主动买卖成交额K线，前端用来画「现货/合约流入流出」柱状图
+	// 📝 参数: symbol（格式见 FlowSymbolFormat）、interval、limit、diff=false、minLimit=false
+	// 📦 返回 [[秒级时间戳, 流入USD, 流出USD], ...]，按时间升序；前端净流入 = 流入 - 流出
+	// 🔓 不需要登录
+	FlowKlineEndpoint = "/api/v2/kline"
+
+	// FlowSymbolFormat symbol 参数格式: ALL#<币种>#<市场>
+	FlowSymbolFormat = "ALL#%s#%s"
+
+	FlowMarketSpot    = "aggregated_spot_buy_sell_usd" // 🏪 现货（页面切到「现货」）
+	FlowMarketFutures = "aggregated_buy_sell_usd"      // 📜 合约（页面切到「合约」）
+)
+
+// 📏 资金流入流出分页参数
+const (
+	FlowDefaultLimit = 300  // 📄 默认笔数（与前端一致）
+	FlowMaxLimit     = 4320 // 🔝 实测服务端单次最多返回 4320 笔，超过会被截断
+)
+
+// ⏱️ FlowIntervals 资金流入流出可用的时间粒度（还原自前端时间选项）
+// 📝 实测 d1 等未列出的值服务端也接受，但前端没用，这里不放行
+var FlowIntervals = map[string]bool{
+	"m1": true, "m5": true, "m15": true, "m30": true,
+	"h1": true, "h2": true, "h4": true, "h6": true, "h8": true, "h12": true, "h24": true,
+	"w1": true,
+}
+
+// 🌡️ 恐惧贪婪等级分界（还原自前端 onChangeOption，区间为左开右闭，如 (20, 40] 为恐惧）
+const (
+	FearGreedExtremeFearMax = 20 // 😱 <= 20 极度恐惧
+	FearGreedFearMax        = 40 // 😨 <= 40 恐惧
+	FearGreedNeutralMax     = 60 // 😐 <= 60 中性
+	FearGreedGreedMax       = 80 // 😀 <= 80 贪婪，以上为极度贪婪
+)
+
 // 🎨 HeatmapType 币种热力图的指标类型
 // 📝 决定返回数据中 Value 字段的含义，PriceChangePercent 恒为24小时涨跌幅
 const (
@@ -65,9 +125,56 @@ const (
 	HeatmapTypeOI    = "oi"    // 🏦 Value = 持仓量（美元）
 )
 
+// 💥 清算地图接口端点（前台 /pro/futures/LiquidationMap）
+// 🔒 两者均需登录：未带有效 obe 时服务端返回 code=40000（前端据此弹出登录框）
+const (
+	// LiqMapEndpoint 单一交易对清算地图
+	// 📝 参数: merge=true、symbol（Binance_BTCUSDT 格式）、interval、limit、data（TOTP签名，见 generateLiqSign）
+	LiqMapEndpoint = "/api/index/5/liqMap"
+
+	// ExLiqMapEndpoint 交易所聚合清算地图
+	// 📝 参数: merge=true、symbol（币种，如 BTC）、interval、limit；不需要 data 签名
+	ExLiqMapEndpoint = "/api/index/2/exLiqMap"
+)
+
+// 🔐 清算接口 data 签名参数（还原自前端，与清算热力图共用）
+// 📐 流程: TOTP(secret, step=30) -> "<unix秒>,<6位码>" -> AES-256-ECB + PKCS7 -> base64
+const (
+	LiqSignTOTPSecret = "I65VU7K5ZQL7WB4E"                 // 🔑 TOTP 密钥（base32）
+	LiqSignTOTPStep   = 30                                 // ⏱️ TOTP 时间步长（秒）
+	LiqSignAESKey     = "1f68efd73f8d4921acc0dead41dd39bc" // 🔒 AES-256 密钥（32字节字符串直接当key）
+)
+
+// 📅 LiqMapRanges 清算地图时间范围 -> 请求参数 interval/limit 的对照
+// 📝 还原自前端 onChangeTime()，key 为页面上的天数选项
+// ⚠️ 7天对应 interval=5 不是 7，90天以上 interval 带 d 后缀，皆为前端原样
+var LiqMapRanges = map[int]struct {
+	Interval string
+	Limit    int
+}{
+	1:   {"1", 1500},
+	7:   {"5", 2000},
+	30:  {"30", 1440},
+	90:  {"90d", 1440},
+	180: {"180d", 1440},
+	365: {"365d", 1440},
+}
+
+// 🚪 LoginRequiredCode 服务端「需要登录」的业务码
+// 📝 前端收到此码即弹出登录框；带了 obe 仍返回此码代表登录态失效
+const LoginRequiredCode = "40000"
+
+// 🔑 LoginHeaderName 登录凭证请求头名称
+// 📝 前端拦截器读取 cookie「obe」并原样放入同名请求头
+const LoginHeaderName = "obe"
+
 // ⏱️ 请求配置
 const (
 	RequestTimeoutSeconds = 30 // HTTP请求超时时间（秒）
+
+	// LoginMinRequestIntervalSeconds 登录状态下两次请求的最小间隔（秒）
+	// 🛡️ 防封：带账号请求时自动限速，避免高频请求导致账号被风控
+	LoginMinRequestIntervalSeconds = 5
 )
 
 // 🎭 RequestHeaders 模拟真实浏览器的请求头

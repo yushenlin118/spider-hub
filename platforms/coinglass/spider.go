@@ -7,9 +7,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-resty/resty/v2"
@@ -30,7 +35,17 @@ type CoinglassResponse struct {
 // 🔧 内置HTTP客户端和加密解密功能
 type Spider struct {
 	client *resty.Client // 🌐 HTTP请求客户端
+
+	loginToken  string     // 🔑 登录凭证（浏览器 cookie「obe」的值），为空表示未登录
+	userAgent   string     // 🎭 自定义 User-Agent，为空则沿用 RequestHeaders
+	mu          sync.Mutex // 🔒 保护 lastRequest，确保并发调用时限速仍然有效
+	lastRequest time.Time  // ⏱️ 上一次请求时间，登录状态下用于限速
 }
+
+// ErrLoginRequired 服务端要求登录（业务码 40000）
+// 🚪 未调用 SetLoginToken，或 obe 已过期/被登出时返回
+// 🛡️ 遇到此错误请勿重试，重新从浏览器取得 obe 后再请求，避免触发风控
+var ErrLoginRequired = errors.New("❌ 需要登录：obe 未设置或已失效，请从浏览器重新取得")
 
 // NewSpider 创建新的Coinglass爬虫实例
 // 🏗️ 初始化爬虫配置，设置超时时间和请求参数
@@ -47,6 +62,40 @@ func NewSpider() *Spider {
 	return &Spider{
 		client: client,
 	}
+}
+
+// SetLoginToken 设置登录凭证，用于访问需要登录的接口（如清算地图）
+// 🔑 token 为浏览器登录 coinglass 后 cookie「obe」的值
+// 📝 取得方式: DevTools -> Application -> Cookies -> www.coinglass.com -> obe
+// 🛡️ 设置后所有请求自动限速（间隔 LoginMinRequestIntervalSeconds 秒），降低账号被封风险
+//
+// ⚠️ obe 等同账号登录态，请勿写进代码或提交到仓库，建议从环境变量读取
+func (s *Spider) SetLoginToken(token string) {
+	s.loginToken = strings.TrimSpace(token)
+}
+
+// SetUserAgent 设置自定义 User-Agent
+// 🎭 建议与取得 obe 的那个浏览器保持一致，同一登录态在不同UA间跳动容易被风控识别
+func (s *Spider) SetUserAgent(ua string) {
+	s.userAgent = strings.TrimSpace(ua)
+}
+
+// waitRateLimit 登录状态下的请求限速
+// 🛡️ 未登录时不限速，保持原有行为；登录时确保两次请求至少间隔 LoginMinRequestIntervalSeconds 秒
+func (s *Spider) waitRateLimit() {
+	if s.loginToken == "" {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	minInterval := LoginMinRequestIntervalSeconds * time.Second
+	if wait := minInterval - time.Since(s.lastRequest); wait > 0 {
+		fmt.Printf("⏳ 登录状态限速，等待 %.1f 秒\n", wait.Seconds())
+		time.Sleep(wait)
+	}
+	s.lastRequest = time.Now()
 }
 
 // GetData 获取任意API数据（通用方法）
@@ -79,6 +128,11 @@ func (s *Spider) GetData(apiURL string) (string, error) {
 	response, meta, err := s.getEncryptedData(apiURL, cacheTsV2)
 	if err != nil {
 		return "", fmt.Errorf("获取加密数据失败: %v", err)
+	}
+
+	// 🚪 业务码 40000 = 需要登录，此时 data 为空，直接返回明确错误而非解密失败
+	if response.Code == LoginRequiredCode {
+		return "", ErrLoginRequired
 	}
 
 	// 🔑 第二步：根据响应头 v 决定密钥来源
@@ -118,6 +172,15 @@ func (s *Spider) getEncryptedData(apiURL, cacheTsV2 string) (*CoinglassResponse,
 		headers[k] = v
 	}
 	headers["cache-ts-v2"] = cacheTsV2 // ⏰ 时间戳密钥，每次请求动态生成
+	if s.loginToken != "" {
+		headers[LoginHeaderName] = s.loginToken // 🔑 登录凭证，与前端拦截器行为一致
+	}
+	if s.userAgent != "" {
+		headers["user-agent"] = s.userAgent // 🎭 与浏览器登录态保持一致
+	}
+
+	// 🛡️ 登录状态下限速
+	s.waitRateLimit()
 
 	// 🚀 发送HTTP GET请求
 	resp, err := s.client.R().SetHeaders(headers).Get(apiURL)
@@ -136,14 +199,20 @@ func (s *Spider) getEncryptedData(apiURL, cacheTsV2 string) (*CoinglassResponse,
 		V:    resp.Header().Get("v"),
 		Time: resp.Header().Get("time"),
 	}
-	if meta.User == "" {
-		return nil, nil, fmt.Errorf("未找到user header")
-	}
-
 	// 📦 解析JSON响应体
 	var response CoinglassResponse
 	if err := json.Unmarshal(resp.Body(), &response); err != nil {
 		return nil, nil, fmt.Errorf("解析响应失败: %v", err)
+	}
+
+	// 🚪 需要登录时服务端返回明文 {"code":"40000"} 且不带 user header，
+	// 必须先放行给 GetData 判断，否则会被误报为「未找到user header」
+	if response.Code == LoginRequiredCode {
+		return &response, meta, nil
+	}
+
+	if meta.User == "" {
+		return nil, nil, fmt.Errorf("未找到user header")
 	}
 
 	return &response, meta, nil
@@ -468,6 +537,337 @@ func (s *Spider) GetCoinsHeatmap(heatmapType string) ([]HeatmapCoin, error) {
 	}
 
 	return coins, nil
+}
+
+// GetFearGreedIndex 获取恐惧贪婪指数历史
+// 😱 对应前台「恐惧&贪婪指数」页（/pro/i/FearGreedIndex），附带当日BTC价格
+// 🔓 不需要登录
+//
+// 参数:
+//
+//	limit - 📏 取最近 N 笔；< 1 时取全量（实测约 3100+ 笔，自 2018-02-01 起）
+//
+// 返回:
+//
+//	[]FearGreedPoint - 📅 按日期升序的指数数据
+//	error            - ❌ 请求或解析失败
+//
+// 使用示例:
+//
+//	points, err := spider.GetFearGreedIndex(30)
+//	latest := points[len(points)-1]  // latest.Value / latest.Level()
+func (s *Spider) GetFearGreedIndex(limit int) ([]FearGreedPoint, error) {
+	// 📏 size 为空字符串即全量（与前端行为一致）
+	size := ""
+	if limit >= 1 {
+		size = strconv.Itoa(limit)
+	}
+
+	data, err := s.GetData(BaseURL + FearGreedIndexEndpoint + "?size=" + size)
+	if err != nil {
+		return nil, fmt.Errorf("❌ 获取恐惧贪婪指数失败: %w", err)
+	}
+
+	return parseFearGreedIndex([]byte(data))
+}
+
+// parseFearGreedIndex 将恐惧贪婪指数原始JSON解析为 []FearGreedPoint
+// 📝 只取 data[0]（前端同样只用它），三个数组按下标合并
+func parseFearGreedIndex(raw []byte) ([]FearGreedPoint, error) {
+	var series []struct {
+		Dates  []int64    `json:"dates"`
+		Values []float64  `json:"values"`
+		Prices []*float64 `json:"prices"` // ⚠️ 可能含 null
+	}
+	if err := json.Unmarshal(raw, &series); err != nil {
+		return nil, fmt.Errorf("❌ 解析恐惧贪婪指数失败: %w", err)
+	}
+	if len(series) == 0 {
+		return nil, fmt.Errorf("❌ 恐惧贪婪指数返回为空")
+	}
+
+	fg := series[0]
+	if len(fg.Values) != len(fg.Dates) || len(fg.Prices) != len(fg.Dates) {
+		return nil, fmt.Errorf("❌ 恐惧贪婪指数数组长度不一致: dates=%d values=%d prices=%d",
+			len(fg.Dates), len(fg.Values), len(fg.Prices))
+	}
+
+	points := make([]FearGreedPoint, len(fg.Dates))
+	for i := range fg.Dates {
+		points[i] = FearGreedPoint{Date: fg.Dates[i], Value: fg.Values[i]}
+		if fg.Prices[i] != nil {
+			points[i].Price = *fg.Prices[i]
+		}
+	}
+	return points, nil
+}
+
+// GetGlobalM2SupplyGrowth 获取比特币 vs 全球M2货币供应增长
+// 💵 对应前台「比特币 vs 全球M2货币供应增长」页（/pro/i/bitcoin-m2-supply-growth）
+// 🌐 接口在 FapiBaseURL（fapi.coinglass.com）下，加密协议相同
+// 🔓 不需要登录，不支持分页，单次返回全量
+//
+// 返回:
+//
+//	[]M2SupplyGrowthPoint - 📅 按日期升序的每周数据
+//	error                 - ❌ 请求或解析失败
+//
+// 使用示例:
+//
+//	points, err := spider.GetGlobalM2SupplyGrowth()
+//	latest := points[len(points)-1]  // latest.M2Supply / latest.YoYGrowth
+func (s *Spider) GetGlobalM2SupplyGrowth() ([]M2SupplyGrowthPoint, error) {
+	data, err := s.GetData(FapiBaseURL + GlobalM2SupplyGrowthEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("❌ 获取全球M2供应增长失败: %w", err)
+	}
+
+	var points []M2SupplyGrowthPoint
+	if err := json.Unmarshal([]byte(data), &points); err != nil {
+		return nil, fmt.Errorf("❌ 解析全球M2供应增长失败: %w", err)
+	}
+
+	return points, nil
+}
+
+// GetSpotFlow 获取现货资金流入流出
+// 🏪 对应前台 /spot-inflow-outflow 顶部图表切到「现货」
+// 🔓 不需要登录
+//
+// 参数:
+//
+//	symbol   - 🪙 币种，如 BTC
+//	interval - ⏱️ 时间粒度，须为 FlowIntervals 的 key，如 h24 / h1 / w1
+//	limit    - 📏 笔数；< 1 或超过 FlowMaxLimit 时退回 FlowDefaultLimit
+//
+// 返回:
+//
+//	[]FlowBar - 📅 按时间升序的K线
+//	error     - ❌ 参数错误、请求或解析失败
+//
+// 使用示例:
+//
+//	bars, err := spider.GetSpotFlow("BTC", "h24", 30)
+//	latest := bars[len(bars)-1]  // latest.InflowUSD / latest.NetFlowUSD()
+func (s *Spider) GetSpotFlow(symbol, interval string, limit int) ([]FlowBar, error) {
+	return s.getFlow(FlowMarketSpot, symbol, interval, limit)
+}
+
+// GetFuturesFlow 获取合约资金流入流出
+// 📜 对应前台 /spot-inflow-outflow 顶部图表切到「合约」，参数与返回同 GetSpotFlow
+// 💡 合约成交额远大于现货（BTC 约 10 倍以上）
+func (s *Spider) GetFuturesFlow(symbol, interval string, limit int) ([]FlowBar, error) {
+	return s.getFlow(FlowMarketFutures, symbol, interval, limit)
+}
+
+// getFlow 资金流入流出共用请求逻辑
+func (s *Spider) getFlow(market, symbol, interval string, limit int) ([]FlowBar, error) {
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return nil, fmt.Errorf("❌ symbol 不能为空")
+	}
+	if !FlowIntervals[interval] {
+		return nil, fmt.Errorf("❌ 无效的时间粒度: %q（可选: m1 / m5 / m15 / m30 / h1 / h2 / h4 / h6 / h8 / h12 / h24 / w1）", interval)
+	}
+	// 📏 分页参数自行修正，不报错
+	if limit < 1 || limit > FlowMaxLimit {
+		limit = FlowDefaultLimit
+	}
+
+	params := url.Values{}
+	params.Set("diff", "false")
+	params.Set("minLimit", "false")
+	params.Set("limit", strconv.Itoa(limit))
+	params.Set("interval", interval)
+	params.Set("symbol", fmt.Sprintf(FlowSymbolFormat, symbol, market))
+
+	data, err := s.GetData(BaseURL + FlowKlineEndpoint + "?" + params.Encode())
+	if err != nil {
+		return nil, fmt.Errorf("❌ 获取资金流入流出失败: %w", err)
+	}
+
+	var bars []FlowBar
+	if err := json.Unmarshal([]byte(data), &bars); err != nil {
+		return nil, fmt.Errorf("❌ 解析资金流入流出失败: %w", err)
+	}
+	return bars, nil
+}
+
+// GetLiquidationMap 获取单一交易对清算地图
+// 💥 对应前台「清算地图」页（/pro/futures/LiquidationMap）
+// 🔒 需要登录：调用前须先 SetLoginToken，否则返回 ErrLoginRequired
+// 🔐 自动生成 data 签名参数（TOTP + AES，见 generateLiqSign）
+//
+// 参数:
+//
+//	symbol    - 🪙 交易对，格式为「交易所_交易对」，如 Binance_BTCUSDT
+//	rangeDays - 📅 时间范围（天），须为 LiqMapRanges 的 key: 1 / 7 / 30 / 90 / 180 / 365
+//
+// 返回:
+//
+//	*LiquidationMap - 📊 清算地图，Levels 按价格区间升序
+//	error           - ❌ 参数错误、需要登录、请求或解密失败
+//
+// 使用示例:
+//
+//	spider.SetLoginToken(os.Getenv("COINGLASS_OBE"))
+//	m, err := spider.GetLiquidationMap("Binance_BTCUSDT", 1)
+//	for _, l := range m.Levels { ... }  // l.Bucket / l.AmountUSD / l.Leverage
+func (s *Spider) GetLiquidationMap(symbol string, rangeDays int) (*LiquidationMap, error) {
+	sign, err := generateLiqSign(time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("❌ 生成清算地图签名失败: %w", err)
+	}
+
+	raw, err := s.getLiqMap(LiqMapEndpoint, symbol, rangeDays, sign)
+	if err != nil {
+		return nil, err
+	}
+	return parseLiquidationMap(raw)
+}
+
+// parseLiquidationMap 将清算地图原始JSON解析为 LiquidationMap
+// 📝 独立出来便于用保存的响应离线验证，不必重复请求
+func parseLiquidationMap(raw []byte) (*LiquidationMap, error) {
+	// 📦 原始结构: liqMapV2 为「价格区间 -> 档位数组」的map
+	var resp struct {
+		Instrument LiqInstrument         `json:"instrument"`
+		LastPrice  float64               `json:"lastPrice"`
+		LiqMapV2   map[string][]LiqLevel `json:"liqMapV2"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("❌ 解析清算地图失败: %w", err)
+	}
+
+	levels, err := flattenLiqMapV2(resp.LiqMapV2)
+	if err != nil {
+		return nil, err
+	}
+
+	return &LiquidationMap{
+		Instrument: resp.Instrument,
+		LastPrice:  resp.LastPrice,
+		Levels:     levels,
+	}, nil
+}
+
+// parseExchangeLiquidationMap 将交易所聚合清算地图原始JSON解析为 ExchangeLiquidationMap
+// 📝 data 数组每个元素是一家交易所，结构与单一交易对的 liqMapV2 相同
+func parseExchangeLiquidationMap(raw []byte) (*ExchangeLiquidationMap, error) {
+	var resp struct {
+		Instrument LiqInstrument `json:"instrument"`
+		LastPrice  float64       `json:"lastPrice"`
+		RangeHigh  float64       `json:"rangeHigh"`
+		RangeLow   float64       `json:"rangeLow"`
+		Data       []struct {
+			Instrument LiqInstrument         `json:"instrument"`
+			LiqMapV2   map[string][]LiqLevel `json:"liqMapV2"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("❌ 解析交易所清算地图失败: %w", err)
+	}
+
+	result := &ExchangeLiquidationMap{
+		Instrument: resp.Instrument,
+		LastPrice:  resp.LastPrice,
+		RangeHigh:  resp.RangeHigh,
+		RangeLow:   resp.RangeLow,
+	}
+	for _, d := range resp.Data {
+		levels, err := flattenLiqMapV2(d.LiqMapV2)
+		if err != nil {
+			return nil, fmt.Errorf("❌ %s: %w", d.Instrument.ExName, err)
+		}
+		result.Exchanges = append(result.Exchanges, ExchangeLiqMap{
+			Instrument: d.Instrument,
+			Levels:     levels,
+		})
+	}
+
+	return result, nil
+}
+
+// flattenLiqMapV2 展平「价格区间 -> 档位数组」的map
+// 🪣 回填 Bucket，并按区间升序（同区间再按杠杆升序）排列
+func flattenLiqMapV2(m map[string][]LiqLevel) ([]LiqLevel, error) {
+	var result []LiqLevel
+	for key, levels := range m {
+		bucket, err := strconv.ParseFloat(key, 64)
+		if err != nil {
+			return nil, fmt.Errorf("❌ 无效的价格区间 %q: %w", key, err)
+		}
+		for _, l := range levels {
+			l.Bucket = bucket
+			result = append(result, l)
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Bucket != result[j].Bucket {
+			return result[i].Bucket < result[j].Bucket
+		}
+		return result[i].Leverage < result[j].Leverage
+	})
+	return result, nil
+}
+
+// GetExchangeLiquidationMap 获取交易所聚合清算地图
+// 💥 对应清算地图页的「交易所」视图，按币种聚合各交易所
+// 🔒 需要登录：调用前须先 SetLoginToken，否则返回 ErrLoginRequired
+// 🏢 实测（2026-10-05）返回 Binance / OKX / Bybit 三家
+// ⚠️ 聚合版每个档位只有价格与金额，Leverage 为 0、Tag 为空（服务端返回 null）
+//
+// 参数:
+//
+//	symbol    - 🪙 币种，如 BTC（不是交易对）
+//	rangeDays - 📅 时间范围（天），同 GetLiquidationMap
+//
+// 返回:
+//
+//	*ExchangeLiquidationMap - 🏢 各交易所清算档位，Levels 按价格区间升序
+//	error                   - ❌ 参数错误、需要登录、请求或解密失败
+func (s *Spider) GetExchangeLiquidationMap(symbol string, rangeDays int) (*ExchangeLiquidationMap, error) {
+	raw, err := s.getLiqMap(ExLiqMapEndpoint, symbol, rangeDays, "")
+	if err != nil {
+		return nil, err
+	}
+	return parseExchangeLiquidationMap(raw)
+}
+
+// getLiqMap 清算地图共用请求逻辑
+// 📝 sign 为空时不带 data 参数（exLiqMap 不需要签名）
+func (s *Spider) getLiqMap(endpoint, symbol string, rangeDays int, sign string) (json.RawMessage, error) {
+	r, ok := LiqMapRanges[rangeDays]
+	if !ok {
+		return nil, fmt.Errorf("❌ 无效的时间范围: %d 天（可选: 1 / 7 / 30 / 90 / 180 / 365）", rangeDays)
+	}
+	if strings.TrimSpace(symbol) == "" {
+		return nil, fmt.Errorf("❌ symbol 不能为空")
+	}
+
+	// 🚪 未登录直接拦截，不浪费一次请求
+	if s.loginToken == "" {
+		return nil, ErrLoginRequired
+	}
+
+	params := url.Values{}
+	params.Set("merge", "true")
+	params.Set("symbol", symbol)
+	params.Set("interval", r.Interval)
+	params.Set("limit", strconv.Itoa(r.Limit))
+	if sign != "" {
+		params.Set("data", sign)
+	}
+
+	data, err := s.GetData(BaseURL + endpoint + "?" + params.Encode())
+	if err != nil {
+		return nil, fmt.Errorf("❌ 获取清算地图失败: %w", err)
+	}
+
+	if !json.Valid([]byte(data)) {
+		return nil, fmt.Errorf("❌ 清算地图返回的不是合法JSON: %.100s", data)
+	}
+	return json.RawMessage(data), nil
 }
 
 // ResponseMeta 响应头中与解密相关的元数据

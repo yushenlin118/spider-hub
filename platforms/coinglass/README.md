@@ -15,6 +15,10 @@ Coinglass 是一个专业的加密货币数据分析平台，提供期货、现�
 - 🏦 比特币现货ETF净流入流出（含各发行商明细）
 - 📋 比特币现货ETF清单（AUM、管理费率、托管方）
 - 🔥 币种热力图（首页「热力图(24小时)」，1612个币种）
+- 😱 恐惧贪婪指数（2018-02-01 起每日数据，附BTC价格）
+- 💵 比特币 vs 全球M2货币供应增长（2013 起每周数据，接口在 fapi 域名）
+- 💸 现货 / 合约资金流入流出（任意币种，m1 ~ w1 粒度）
+- 💥 清算地图（交易对 / 交易所聚合，需要登录）
 
 ## API 接口说明 📋
 
@@ -292,6 +296,66 @@ type HeatmapCoin struct {
 
 > 后两个是在解密功能正常的前提下复测的，`null` 与 `value=0` 均为服务端真实响应，并非密钥问题导致的假象。
 
+### 12. 恐惧贪婪指数 (`/api/index/history`) 😱
+
+对应前台 `/pro/i/FearGreedIndex`，**不需要登录**。方法 `GetFearGreedIndex(limit)`：`limit < 1` 取全量（`size=` 空字符串），否则取最近 N 笔（`size=N`）。
+
+- 原始响应是数组，前端只用 `data[0]`：`dates` / `values` / `prices` 三个等长数组，已按下标合并为 `[]FearGreedPoint`
+- `data[1]`、`data[2]` 是另外两条序列，前端未使用、含义未知，未解析
+- `prices` 可能含 `null`，解析为 `0`
+- `Level()` 返回等级，分界还原自前端：`<=20` 极度恐惧、`<=40` 恐惧、`<=60` 中性、`<=80` 贪婪、其余极度贪婪
+
+**测试输出（2026-10-05 实测）:**
+
+```
+✅ 恐惧贪婪指数全量获取成功，共 3147 笔，区间 2018-02-01 ~ 2026-10-05
+😱 最近7天恐惧贪婪指数:
+  2026-10-04   64.0  贪婪      BTC $84817
+  2026-10-05   71.0  贪婪      BTC $86454
+📊 历史等级分布:
+  极度恐惧     413 天 (13.12%)
+  恐惧       999 天 (31.74%)
+  中性       805 天 (25.58%)
+  贪婪       781 天 (24.82%)
+  极度贪婪     149 天 (4.73%)
+```
+
+### 13. 比特币 vs 全球M2货币供应增长 (`fapi.coinglass.com/api/index/globalM2SupplyGrowth`) 💵
+
+对应前台 `/pro/i/bitcoin-m2-supply-growth`，**不需要登录**、不带参数。方法 `GetGlobalM2SupplyGrowth()`。
+
+- ⚠️ 接口在 **`fapi.coinglass.com`**（`FapiBaseURL`）而非 `capi`，前端直接写死完整URL；加密协议完全相同，`GetData` 可直接请求
+- 每周一笔，字段 `timestamp` / `price`（BTC） / `m2Supply`（美元） / `yoyGrowth`（同比%）
+- M2 是宏观数据，最新一笔通常落后当前日期约一个月
+- 同类接口 `/api/index/uSM2SupplyGrowth`（美国M2，前台 `/pro/i/bitcoin-us-m2-supply-growth`）也在 fapi 下，尚未封装
+
+### 14. 现货 / 合约资金流入流出 (`/api/v2/kline`) 💸
+
+对应前台 `/spot-inflow-outflow` 顶部图表（「合约 / 现货」切换），**不需要登录**。方法 `GetSpotFlow(symbol, interval, limit)` / `GetFuturesFlow(symbol, interval, limit)`。
+
+| 参数 | 说明 |
+|---|---|
+| `symbol` | 拼成 `ALL#<币种>#<市场>`；现货市场 `aggregated_spot_buy_sell_usd`，合约 `aggregated_buy_sell_usd` |
+| `interval` | `m1` `m5` `m15` `m30` `h1` `h2` `h4` `h6` `h8` `h12` `h24` `w1`（前端默认 `h24`） |
+| `limit` | 默认 300（同前端），服务端实测单次最多 4320 |
+
+- 返回 `[[秒级时间戳, 流入USD, 流出USD], ...]`，解析为 `[]FlowBar`；`NetFlowUSD()` = 流入 − 流出，同前端「净流入」开关
+- ⚠️ 时间戳是**秒**，不是毫秒
+- 最后一根K线是进行中的当期，数值会持续变动
+- ⚠️ 前端 `_app` 的 API 导出名有重名，按名字对照会误以为是 `/api/largeTakerOrder`；要从页面 import 的模块 id 去解析，实际是 `/api/v2/kline`
+- 页面下方表格另有 `/api/spot/coin/outIn`（各币种 m5 ~ d30 流入流出排行，参数 `pageNum/sort/order/keyword`）与 `/api/spot/outIn/category`，尚未封装
+
+**测试输出（2026-10-05 实测，百万美元）:**
+
+```
+💸 BTC现货最近7天流入流出:
+  2026-10-04  流入     997.47  流出     935.12  净流入    +62.36
+  2026-10-05  流入    1059.03  流出    1173.19  净流入   -114.16
+💸 BTC合约最近7天流入流出:
+  2026-10-04  流入   13898.30  流出   12495.24  净流入  +1403.06
+  2026-10-05  流入   12565.79  流出   12790.04  净流入   -224.25
+```
+
 ### 清算热力图的参数与签名 🔒
 
 参数格式（从前端还原）：
@@ -313,7 +377,63 @@ type HeatmapCoin struct {
 // 4. base64 输出
 ```
 
-签名本身已验证可被服务端接受（未带签名时报 `Required String parameter 'data' is not present`，带上后变为登录校验），**但该接口额外要求登录态**，因此本项目未实现该签名。若后续补上登录，按上述步骤生成 `data` 即可。
+签名本身已验证可被服务端接受（未带签名时报 `Required String parameter 'data' is not present`，带上后变为登录校验），**但该接口额外要求登录态**。签名已实现为 `generateLiqSign()`（`utils.go`），清算地图直接复用。
+
+## 💥 清算地图（需要登录）🔒
+
+对应前台 `/pro/futures/LiquidationMap`，两个接口都要登录，未登录返回 `code=40000`：
+
+| 方法 | 端点 | `symbol` 格式 | 签名 |
+|---|---|---|---|
+| `GetLiquidationMap(symbol, rangeDays)` | `/api/index/5/liqMap` | `Binance_BTCUSDT` | 需要 `data`（自动生成） |
+| `GetExchangeLiquidationMap(symbol, rangeDays)` | `/api/index/2/exLiqMap` | `BTC` | 不需要 |
+
+`rangeDays` 对应页面的时间选项，参数还原自前端 `onChangeTime()`（见 `LiqMapRanges`）：
+
+| 天数 | `interval` | `limit` |
+|---|---|---|
+| 1 | `1` | 1500 |
+| 7 | `5` ⚠️ 不是 7 | 2000 |
+| 30 | `30` | 1440 |
+| 90 / 180 / 365 | `90d` / `180d` / `365d` | 1440 |
+
+**登录方式**：前端拦截器读取 cookie `obe`，原样放进同名请求头 `obe`。在浏览器登录后从 DevTools → Application → Cookies 取出 `obe` 的值：
+
+```go
+spider := coinglass.NewSpider()
+spider.SetLoginToken(os.Getenv("COINGLASS_OBE"))  // ⚠️ 等同账号登录态，勿写进代码
+spider.SetUserAgent(os.Getenv("COINGLASS_UA"))    // 可选：与取 obe 的浏览器一致
+raw, err := spider.GetLiquidationMap("Binance_BTCUSDT", 1)
+if errors.Is(err, coinglass.ErrLoginRequired) { /* obe 失效，重新取得，勿重试 */ }
+```
+
+**🛡️ 防封设计**：
+
+- 设置 `obe` 后，所有请求自动限速，两次至少间隔 `LoginMinRequestIntervalSeconds`（5 秒）
+- 收到 `40000` 立即返回 `ErrLoginRequired`，不自动重试
+- 未设置 `obe` 时清算地图方法直接在本地拦截，不发请求
+
+**返回结构**（`GetLiquidationMap`，2026-10-05 实测）：原始响应为 `{instrument, lastPrice, liqMapV2}`，`liqMapV2` 是「价格区间 → `[[价格, 金额USD, 杠杆, 标签], ...]`」的 map，已展平为按区间升序的 `[]LiqLevel`：
+
+| 字段 | 说明 |
+|---|---|
+| `Bucket` | 价格区间（原 map key，恒 ≥ `Price`），前端以此为横轴 |
+| `Price` | 精确清算价格，前端读取但未使用 |
+| `AmountUSD` | 清算金额（美元） |
+| `Leverage` | 杠杆倍数，实测只有 10 / 25 / 50 / 100 |
+| `Tag` | `h1` / `h2` / `h3`，**含义未知**：前端完全未使用，三组金额分布也无明显差异 |
+
+**交易所聚合版**（`GetExchangeLiquidationMap`，2026-10-05 实测）：原始响应为 `{instrument, lastPrice, rangeHigh, rangeLow, data: [{instrument, liqMapV2}, ...]}`，`data` 每个元素是一家交易所（实测为 Binance / OKX / Bybit），解析为 `[]ExchangeLiqMap`。与单一交易对版的差异：
+
+- 档位只有价格与金额，`Leverage` 为 0、`Tag` 为空（服务端返回 `null`）
+- 每个价格区间只有一笔
+- 顶层 `instrument` 为参考交易对（实测 Binance BTCUSDT），`lastPrice` 取自它
+- 前端画法：现价以下累加为多单清算曲线，现价以上累加为空单清算曲线
+
+```bash
+# 只发一次请求
+COINGLASS_OBE=xxx go test -run 'TestLiquidationMap$' -v
+```
 
 ## 🧪 测试和示例
 
@@ -326,6 +446,15 @@ go test -run TestETF -v
 
 # 只运行热力图测试
 go test -run TestCoinsHeatmap -v
+
+# 只运行恐惧贪婪指数测试
+go test -run TestFearGreedIndex -v
+
+# 只运行全球M2测试
+go test -run TestGlobalM2SupplyGrowth -v
+
+# 只运行资金流入流出测试
+go test -run TestCoinFlow -v
 
 # 运行单个测试
 go test -run TestETFFlow -v
