@@ -1,142 +1,139 @@
 # 🕷️ Spider-Hub
 
-> 一个专注于各平台爬虫逆向技术的Go语言项目集合
+> 一個專注於各平台爬蟲逆向技術的 Go 語言專案集合，外加一個把 Coinglass 資料寫入 PostgreSQL 的收集器
 
-[![Go Version](https://img.shields.io/badge/Go-1.24.4+-blue.svg)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-blue.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Go Report Card](https://goreportcard.com/badge/github.com/xieburoucoco/spider-hub)](https://goreportcard.com/report/github.com/xieburoucoco/spider-hub)
 
-## 📖 项目简介
+> **出處**：本專案 fork 自 [xieburoucoco/spider-hub](https://github.com/xieburoucoco/spider-hub)（Apache 2.0）。在原專案基礎上新增了 Coinglass 的恐懼貪婪指數、全球 M2、現貨／合約資金流入流出、清算地圖等接口，以及定期寫入 PostgreSQL 的收集器 [`collectors/coinglass`](collectors/coinglass/README.md)。原專案的著作權與授權條款維持不變，見 [LICENSE](LICENSE)。
 
-Spider-Hub 是一个专注于各平台爬虫逆向技术的Go语言项目集合。本项目旨在通过不断挑战各种网站的爬虫逆向，收集和整理各个平台的爬虫技术，为爬虫爱好者提供学习和参考资源。
+## 📖 專案簡介
+
+Spider-Hub 收集各網站的爬蟲逆向實作，每個平台是一個獨立的 Go package，記錄該站的加密、簽章、指紋檢測等關卡，以及對應的破解方式，供學習與參考。
+
+`platforms/` 底下都是範例程式碼；唯一可部署的程式是 `collectors/coinglass`。
 
 ## ✨ 功能特性
 
-- 🔍 **多平台支持**: 涵盖国内外主流电商、社交媒体、新闻资讯、加密货币区块链等平台
-- 📊 **数据采集**: 高效稳定的数据采集和存储方案
-- 🔧 **工具集成**: 提供常用的爬虫工具和辅助脚本
-- 📚 **技术文档**: 详细的技术分析和逆向过程记录
-- 🚀 **持续更新**: 定期更新最新的爬虫技术和平台变化
+- 🔍 **多平台支援**：涵蓋電商、圖庫、新聞資訊、加密貨幣數據等平台
+- 🔐 **逆向紀錄**：每個平台的 README 記錄加密協定、簽章演算法與找端點的方法
+- 🗄️ **資料收集器**：Coinglass 資料定期入庫，排程、增量回補、登入保護都已內建
+- 🤖 **給 AI agent 用的資料說明**：資料表與欄位說明寫在資料庫註解裡，另附 [DATA.md](collectors/coinglass/DATA.md) 使用指南
 
-## 🏗️ 项目结构
+## 🏗️ 專案結構
 
 ```
 spider-hub/
-├── README.md                 # 项目说明文档
-├── LICENSE                   # 开源协议
-├── go.mod                    # Go模块文件
-├── go.sum                    # 依赖校验文件
-├── .gitignore               # Git忽略文件
-├── platforms/               # 各平台爬虫实现
-│   └── coinglass/          # Coinglass平台
-├── cmd/                     # 命令行工具
-│   └── spider-hub/         # 主程序入口
-└── internal/                # 内部工具包
-    └── util/             # 工具
+├── README.md                 # 專案說明文件
+├── LICENSE                   # 開源協議（Apache 2.0）
+├── CLAUDE.md                 # 給 AI 程式助手的開發說明
+├── go.mod / go.sum           # Go 模組檔案
+├── cmd/
+│   └── spider-hub/           # 主程式入口（只印說明文字）
+├── platforms/                # 各平台爬蟲實作（彼此獨立、不互相 import）
+│   ├── amazon/               # Amazon 商品詳情與圖搜
+│   ├── coinglass/            # Coinglass 加密貨幣數據
+│   ├── foresightnews/        # Foresight News 快訊
+│   └── pexels/               # Pexels 影片搜尋
+└── collectors/
+    └── coinglass/            # Coinglass → PostgreSQL 常駐收集器
 ```
 
-## 🚀 快速开始
+## 🚀 快速開始
 
-### 环境要求
+### 環境需求
 
-- Go 1.24.4+
+- Go 1.24+
 - Git
+- PostgreSQL（只有收集器需要）
 
-### 安装步骤
+### 安裝步驟
 
-1. **克隆项目**
+1. **複製專案**
 ```bash
-git clone https://github.com/xieburoucoco/spider-hub.git
+git clone git@github.com:yushenlin118/spider-hub.git
 cd spider-hub
 ```
 
-2. **安装依赖**
+2. **安裝依賴**
 ```bash
 go mod download
 ```
+
+> Go module 路徑仍是 `github.com/xieburoucoco/spider-hub`，在本 repo 內建置不受影響。
 
 ## 📚 使用指南
 
 ### 平台使用
 
-每个平台都有独立的实现和文档，请进入对应的平台目录查看详细说明：
+每個平台都有獨立的實作與文件，請進入對應目錄查看：
 
 ```bash
-# 查看Coinglass平台说明
+# 查看 Coinglass 平台說明
 cd platforms/coinglass
 cat README.md
 
-# 运行Coinglass测试用例
-go test -v
-
-# 运行Coinglass示例
-go test -run TestCoinglassAPI -v
+# 執行單一測試（測試會印大量輸出，-v 是必要的）
+go test -run TestFearGreedIndex -v
 ```
+
+> ⚠️ 測試都會直接請求線上 API，沒有 mock。失敗時常是目標站台改版、被風控或需要代理，不一定是程式碼問題。不建議執行 `go test ./...`，那會一次打所有平台的線上 API。
 
 ### 平台列表
 
-- **Coinglass**: 加密货币数据平台（已破解AES加密） - [查看详情](platforms/coinglass/README.md)
-- 更多平台持续添加中...
+| 平台 | 內容 | 逆向重點 | 文件 |
+|---|---|---|---|
+| **Coinglass** | ETF 流入流出、熱力圖、清算地圖、恐懼貪婪、全球 M2、資金流入流出 | 雙層 AES-ECB + gzip，金鑰來源依回應標頭 `v` 切換；清算接口需 TOTP 簽章與登入 | [查看詳情](platforms/coinglass/README.md) |
+| **Amazon** | 商品詳情、以圖搜圖 | HTML 解析；圖搜需先取 `stylesnap` token | [查看詳情](platforms/amazon/README.md) |
+| **Foresight News** | 新聞快訊 | 回應 `data` 為 base64 + zlib | [查看詳情](platforms/foresightnews/README.md) |
+| **Pexels** | 影片搜尋 | Next.js data 端點 + Safari TLS 指紋偽裝 | [查看詳情](platforms/pexels/README.md) |
 
-## 🔧 开发指南
+### Coinglass 收集器
 
-### 添加新平台
+定期抓取 Coinglass 資料寫入 PostgreSQL，只會在 `public` schema 新增 `coinglass_*` 資料表，不會碰其他資料表：
 
-1. 在 `platforms/` 目录下创建新平台目录
-2. 实现爬虫核心逻辑
-3. 添加相应的测试文件
-4. 更新平台README文档
+```bash
+# 所有任務立刻跑一次
+DATABASE_URL='postgres://...' go run ./collectors/coinglass -once
 
-### 代码规范
+# 常駐模式（內建排程，重啟不會重抓）
+DATABASE_URL='postgres://...' go run ./collectors/coinglass
+```
 
-- 遵循 Go 官方代码规范
-- 使用 `gofmt` 格式化代码
-- 添加必要的注释和文档
-- 编写单元测试
+任務頻率、環境變數、Docker 部署與維運方式見 [collectors/coinglass/README.md](collectors/coinglass/README.md)；資料怎麼查詢見 [DATA.md](collectors/coinglass/DATA.md)。
 
-## 📊 技术栈
+## 🔧 開發指南
 
-- **语言**: Go 1.24.4+
-- **HTTP客户端**: resty
-- **数据解析**: 用户自由选择
-- **数据存储**: 用户自由选择
+### 新增平台
 
-## 🤝 贡献指南
+1. 在 `platforms/` 下建立新的平台目錄，不需要修改任何既有檔案
+2. 依介面形態選擇命名：所有 API 結構相同用 `spider.go` / `Spider`，結構各異用 `<platform>.go` / `<Platform>Spider`
+3. 固定檔案：主檔案、`types.go`、`constants.go`、`example_test.go`、`README.md`（每個平台只有一份）
+4. 更新本文件的平台列表
 
-欢迎提交 Issue 和 Pull Request！
+### 程式碼規範
 
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 打开 Pull Request
+- 遵循 Go 官方程式碼規範
+- 使用 `gofmt` 格式化程式碼
+- 錯誤與日誌訊息用中文並帶 emoji 前綴（`❌`、`✅`、`⚠️`）
+- 對外方法第一個參數是 `context.Context`
 
-## 📄 开源协议
+## 📊 技術棧
 
-本项目采用 [Apache 2.0](LICENSE) 开源协议。
+- **語言**：Go 1.24+
+- **HTTP 客戶端**：resty（一般請求）、imroc/req（瀏覽器指紋偽裝）、net/http（簡單情境）
+- **資料解析**：goquery（HTML）、encoding/json
+- **資料儲存**：PostgreSQL（pgx，僅收集器使用）
 
-## 🔗 相关链接
+## 📄 開源協議
 
-- [项目主页](https://github.com/xieburoucoco/spider-hub)
-- [问题反馈](https://github.com/xieburoucoco/spider-hub/issues)
+本專案沿用原專案的 [Apache 2.0](LICENSE) 開源協議。
 
-## ⚠️ 免责声明
+## 🔗 相關連結
 
-本项目仅供学习和研究使用，请遵守相关网站的使用条款和robots.txt协议。使用者需要自行承担使用风险，作者不承担任何法律责任。
+- [本專案](https://github.com/yushenlin118/spider-hub)
+- [原專案 xieburoucoco/spider-hub](https://github.com/xieburoucoco/spider-hub)
 
-## 📈 项目统计
+## ⚠️ 免責聲明
 
-![GitHub stars](https://img.shields.io/github/stars/xieburoucoco/spider-hub)
-![GitHub forks](https://img.shields.io/github/forks/xieburoucoco/spider-hub)
-![GitHub issues](https://img.shields.io/github/issues/xieburoucoco/spider-hub)
-![GitHub pull requests](https://img.shields.io/github/issues-pr/xieburoucoco/spider-hub)
-
-## 💼 商务合作
-
-如有商务合作需求，请联系：
-
-📧 **邮箱**: xieburoucoco@gmail.com
-
----
-
-⭐ 如果这个项目对您有帮助，请给我们一个星标！
+本專案僅供學習與研究使用，請遵守相關網站的使用條款與 robots.txt 協議。使用者須自行承擔使用風險，作者不承擔任何法律責任。
